@@ -28,7 +28,7 @@ This is the simplest and likely best first step.
 - Canonicalize them: pelvis/root at origin, feet near ground, forward axis fixed, consistent units in meters.
 - Store metadata: fps, stride_length_m, root_joint_offset, vertical_axis, forward_axis, body_shape_id.
 
-## Notes for future agents
+## Notes for Adaptation:
 
 The useful code path is `datageneration/main_part1.py`, not the Torch training code. It already:
 
@@ -36,6 +36,8 @@ The useful code path is `datageneration/main_part1.py`, not the Torch training c
 - Applies SMPL `trans`, `pose`, and `shape` in `apply_trans_pose_shape`.
 - Iterates over animation frames before rendering.
 - Uses `ob.to_mesh(scene, True, 'PREVIEW')` elsewhere, which is the likely mechanism for evaluated posed mesh export.
+
+We have already obtained a script to export OBJ frames of human walking animation, `datageneration/export_obj_frames.sh` and `datageneration/export_obj_frames.py`. It is a simplified path that directly exports posed meshes without RGB compositing, camera calibration, lighting, or Blender scene setup. Available walking sequences are indexed by `--idx` (e.g., "02_01"), and verified ones are documented in `datageneration/misc/walking_sequences.txt`.
 
 There are two project paths under consideration:
 
