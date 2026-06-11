@@ -9,3 +9,4 @@ training/models/*.t7
 __pycache__/
 *.oso
 outputs/
+logs/

@@ -52,7 +52,7 @@ PART_MATCH = {
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     parser = argparse.ArgumentParser(description="Export SURREAL SMPL OBJ frames.")
-    parser.add_argument("--idx", type=int, default=0, help="SURREAL/CMU sequence index.")
+    parser.add_argument("--idx", type=str, default="02_02", help="SURREAL/CMU sequence index.")
     parser.add_argument("--gender", choices=("female", "male"), default="female")
     parser.add_argument("--start", type=int, default=0, help="Original motion start frame.")
     parser.add_argument("--frames", type=int, default=30, help="Number of OBJ frames to export.")
@@ -155,8 +155,8 @@ def load_body_data(smpl_data, gender, idx):
     )
     if not sequence_names:
         raise RuntimeError("No pose_* sequences found in SMPL data.")
-
-    sequence_name = sequence_names[idx % len(sequence_names)]
+    
+    sequence_name = idx.strip()
     poses = smpl_data["pose_" + sequence_name]
     trans = smpl_data["trans_" + sequence_name]
     return sequence_names, sequence_name, poses, trans
@@ -314,8 +314,6 @@ def main():
 
     metadata = {
         "sequence_name": sequence_name,
-        "sequence_index_requested": args.idx,
-        "sequence_index_resolved": args.idx % len(sequence_names),
         "gender": args.gender,
         "shape_mode": args.shape,
         "shape_coefficients": shape.tolist(),
