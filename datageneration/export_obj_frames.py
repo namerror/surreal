@@ -17,7 +17,12 @@ from os.path import abspath, exists, join
 
 import bpy
 import numpy as np
-from mathutils import Euler, Matrix, Quaternion, Vector
+from mathutils import Matrix, Vector
+
+
+AXIS_CHOICES = ("x", "-x", "y", "-y", "z", "-z")
+AXIS_DIMS = {"x": 0, "y": 1, "z": 2}
+AXIS_OPTIONS = ("--forward-axis", "--left-axis", "--up-axis")
 
 
 PART_MATCH = {
@@ -51,6 +56,7 @@ PART_MATCH = {
 
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
+    argv = normalize_axis_args(argv)
     parser = argparse.ArgumentParser(description="Export SURREAL SMPL OBJ frames.")
     parser.add_argument("--idx", type=str, default="02_02", help="SURREAL/CMU sequence index.")
     parser.add_argument("--gender", choices=("female", "male"), default="female")
@@ -61,8 +67,89 @@ def parse_args():
     parser.add_argument("--smpl-data-folder", default="smpl_data")
     parser.add_argument("--smpl-data-filename", default="smpl_data.npz")
     parser.add_argument("--shape", choices=("average",), default="average")
-    parser.add_argument("--zrot", type=float, default=0.0, help="Root yaw in radians.")
+    parser.add_argument(
+        "--zrot",
+        type=float,
+        default=0.0,
+        help="Post-canonical yaw around target +Z in radians.",
+    )
+    parser.add_argument(
+        "--forward-axis",
+        choices=AXIS_CHOICES,
+        default="x",
+        help="Raw evaluated mesh axis to use as canonical +X forward.",
+    )
+    parser.add_argument(
+        "--left-axis",
+        choices=AXIS_CHOICES,
+        default="z",
+        help="Raw evaluated mesh axis to use as canonical +Y left.",
+    )
+    parser.add_argument(
+        "--up-axis",
+        choices=AXIS_CHOICES,
+        default="-y",
+        help="Raw evaluated mesh axis to use as canonical +Z up.",
+    )
     return parser.parse_args(argv)
+
+
+def normalize_axis_args(argv):
+    normalized = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if (
+            arg in AXIS_OPTIONS
+            and index + 1 < len(argv)
+            and argv[index + 1] in AXIS_CHOICES
+        ):
+            normalized.append("%s=%s" % (arg, argv[index + 1]))
+            index += 2
+            continue
+        normalized.append(arg)
+        index += 1
+    return normalized
+
+
+def axis_dim(axis):
+    return AXIS_DIMS[axis[-1]]
+
+
+def axis_vector(axis):
+    sign = -1.0 if axis.startswith("-") else 1.0
+    vec = np.zeros(3)
+    vec[axis_dim(axis)] = sign
+    return vec
+
+
+def build_axis_transform(forward_axis, left_axis, up_axis):
+    axes = (forward_axis, left_axis, up_axis)
+    dims = [axis_dim(axis) for axis in axes]
+    if len(set(dims)) != 3:
+        raise ValueError(
+            "Coordinate axes must use distinct raw dimensions; got "
+            "--forward-axis %s, --left-axis %s, --up-axis %s."
+            % (forward_axis, left_axis, up_axis)
+        )
+
+    matrix = np.vstack([axis_vector(axis) for axis in axes])
+    det = np.linalg.det(matrix)
+    if det <= 0:
+        raise ValueError(
+            "Coordinate axes must form a right-handed basis; got "
+            "--forward-axis %s, --left-axis %s, --up-axis %s."
+            % (forward_axis, left_axis, up_axis)
+        )
+    return matrix
+
+
+def yaw_matrix(zrot):
+    cos_z = np.cos(zrot)
+    sin_z = np.sin(zrot)
+    return np.asarray(
+        [[cos_z, -sin_z, 0.0], [sin_z, cos_z, 0.0], [0.0, 0.0, 1.0]]
+    )
 
 
 def rodrigues(rotvec):
@@ -155,7 +242,7 @@ def load_body_data(smpl_data, gender, idx):
     )
     if not sequence_names:
         raise RuntimeError("No pose_* sequences found in SMPL data.")
-    
+
     sequence_name = idx.strip()
     poses = smpl_data["pose_" + sequence_name]
     trans = smpl_data["trans_" + sequence_name]
@@ -211,30 +298,61 @@ def reset_joint_positions(orig_trans, shape, ob, arm_ob, obname, reg_ivs, joint_
     bpy.ops.object.mode_set(mode="OBJECT")
 
 
-def export_evaluated_obj(ob, filepath):
+def vector_to_array(vec):
+    return np.asarray((vec.x, vec.y, vec.z), dtype=np.float64)
+
+
+def pelvis_world_position(arm_ob, obname):
+    pelvis = arm_ob.pose.bones[obname + "_Pelvis"].head.copy()
+    return vector_to_array(arm_ob.matrix_world @ pelvis)
+
+
+def write_obj(filepath, vertices, normals, mesh):
+    with open(filepath, "w") as f:
+        f.write("# Canonical pelvis-XY-centered, feet-grounded SMPL OBJ\n")
+        f.write("o smpl_canonical\n")
+        for vertex in vertices:
+            f.write("v %.9f %.9f %.9f\n" % tuple(vertex))
+        for normal in normals:
+            f.write("vn %.9f %.9f %.9f\n" % tuple(normal))
+        for polygon in mesh.polygons:
+            face = []
+            for vertex_index, loop_index in zip(polygon.vertices, polygon.loop_indices):
+                face.append("%d//%d" % (vertex_index + 1, loop_index + 1))
+            f.write("f %s\n" % " ".join(face))
+
+
+def export_evaluated_obj(ob, filepath, pelvis_world, source_to_target):
     mesh, matrix_world = evaluated_mesh_for_object(ob)
-    temp_ob = bpy.data.objects.new("_smpl_export_eval", mesh)
-    temp_ob.matrix_world = matrix_world
-    bpy.context.collection.objects.link(temp_ob)
+    try:
+        normal_matrix = matrix_world.to_3x3().inverted().transposed()
+        mesh.calc_normals_split()
 
-    set_active(temp_ob)
-    bpy.ops.export_scene.obj(
-        filepath=filepath,
-        use_selection=True,
-        use_mesh_modifiers=False,
-        use_materials=False,
-        use_uvs=False,
-        use_normals=True,
-        use_triangles=False,
-        axis_forward="Y",
-        axis_up="Z",
-    )
+        pelvis_target = source_to_target.dot(pelvis_world)
+        vertices = np.empty((len(mesh.vertices), 3), dtype=np.float64)
+        for index, vertex in enumerate(mesh.vertices):
+            world = vector_to_array(matrix_world @ vertex.co)
+            vertices[index] = source_to_target.dot(world)
 
-    vertex_count = len(mesh.vertices)
-    face_count = len(mesh.polygons)
-    bpy.data.objects.remove(temp_ob, do_unlink=True)
-    bpy.data.meshes.remove(mesh)
-    return vertex_count, face_count
+        vertices[:, 0] -= pelvis_target[0]
+        vertices[:, 1] -= pelvis_target[1]
+        ground_height = float(vertices[:, 2].min())
+        vertices[:, 2] -= ground_height
+
+        normals = np.empty((len(mesh.loops), 3), dtype=np.float64)
+        for index, loop in enumerate(mesh.loops):
+            world_normal = vector_to_array(normal_matrix @ loop.normal)
+            normal = source_to_target.dot(world_normal)
+            length = np.linalg.norm(normal)
+            normals[index] = normal / length if length > 0.0 else normal
+
+        write_obj(filepath, vertices, normals, mesh)
+
+        vertex_count = len(mesh.vertices)
+        face_count = len(mesh.polygons)
+        return vertex_count, face_count, ground_height
+    finally:
+        bpy.data.meshes.remove(mesh)
 
 
 def validate_args(args, poses):
@@ -251,6 +369,7 @@ def validate_args(args, poses):
             "Requested frames exceed sequence length: last source frame %d, "
             "sequence has %d frames." % (last_frame, len(poses))
         )
+    build_axis_transform(args.forward_axis, args.left_axis, args.up_axis)
 
 
 def main():
@@ -264,6 +383,10 @@ def main():
     smpl_data = np.load(smpl_data_path)
     sequence_names, sequence_name, poses, trans = load_body_data(smpl_data, args.gender, args.idx)
     validate_args(args, poses)
+    axis_transform = build_axis_transform(
+        args.forward_axis, args.left_axis, args.up_axis
+    )
+    source_to_target = yaw_matrix(args.zrot).dot(axis_transform)
 
     shape = np.zeros(10)
     print("Initializing SMPL %s model" % args.gender)
@@ -280,7 +403,10 @@ def main():
         smpl_data["joint_regressor"],
     )
 
-    sequence_dir = "%s_%s_avg_raw" % (sequence_name.replace(" ", ""), args.gender)
+    sequence_dir = "%s_%s_avg_pelvis_centered_axes" % (
+        sequence_name.replace(" ", ""),
+        args.gender,
+    )
     output_dir = abspath(join(args.out, sequence_dir))
     os.makedirs(output_dir, exist_ok=True)
 
@@ -288,6 +414,8 @@ def main():
         args.start + export_frame * args.stepsize for export_frame in range(args.frames)
     ]
     exported_files = []
+    pelvis_positions = []
+    ground_heights = []
     vertex_count = None
     face_count = None
 
@@ -296,20 +424,22 @@ def main():
         apply_trans_pose_shape(
             Vector(trans[source_frame]), poses[source_frame], shape, ob, arm_ob, obname
         )
-        arm_ob.pose.bones[obname + "_root"].rotation_quaternion = Quaternion(
-            Euler((0, 0, args.zrot), "XYZ")
-        )
         bpy.context.view_layer.update()
 
         filename = "frame_%06d.obj" % export_frame
         filepath = join(output_dir, filename)
-        curr_vertex_count, curr_face_count = export_evaluated_obj(ob, filepath)
+        pelvis_world = pelvis_world_position(arm_ob, obname)
+        curr_vertex_count, curr_face_count, ground_height = export_evaluated_obj(
+            ob, filepath, pelvis_world, source_to_target
+        )
         if vertex_count is None:
             vertex_count = curr_vertex_count
             face_count = curr_face_count
         elif vertex_count != curr_vertex_count or face_count != curr_face_count:
             raise RuntimeError("Vertex/face count changed while exporting %s." % filename)
         exported_files.append(filename)
+        pelvis_positions.append(pelvis_world.tolist())
+        ground_heights.append(ground_height)
         print("Exported %s from source frame %d" % (filename, source_frame))
 
     metadata = {
@@ -321,7 +451,22 @@ def main():
         "start": args.start,
         "frames": args.frames,
         "stepsize": args.stepsize,
-        "coordinate_mode": "raw",
+        "coordinate_mode": "pelvis_centered_axes",
+        "origin_mode": "pelvis_xy_mesh_floor_z_per_frame",
+        "ground_source": "mesh_min_z",
+        "ground_heights_before_grounding": ground_heights,
+        "units": "meters",
+        "axes": {
+            "forward": args.forward_axis,
+            "left": args.left_axis,
+            "up": args.up_axis,
+            "target_forward": "+x",
+            "target_left": "+y",
+            "target_up": "+z",
+        },
+        "source_to_target_matrix": source_to_target.tolist(),
+        "raw_axis_transform_matrix": axis_transform.tolist(),
+        "raw_pelvis_positions": pelvis_positions,
         "zrot": args.zrot,
         "blender_version": bpy.app.version_string,
         "smpl_fbx_path": fbx_path,
