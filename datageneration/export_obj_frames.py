@@ -11,9 +11,10 @@ or execute export_obj_frames.sh
 import argparse
 import json
 import os
+import shutil
 import sys
 import traceback
-from os.path import abspath, exists, join
+from os.path import abspath, basename, exists, join, relpath
 
 import bpy
 import numpy as np
@@ -67,6 +68,40 @@ def parse_args():
     parser.add_argument("--smpl-data-folder", default="smpl_data")
     parser.add_argument("--smpl-data-filename", default="smpl_data.npz")
     parser.add_argument("--shape", choices=("average",), default="average")
+    parser.add_argument(
+        "--texture-path",
+        default=None,
+        help="Explicit clothing texture image path. Takes priority over list selection.",
+    )
+    parser.add_argument(
+        "--texture-split",
+        choices=("train", "test", "all"),
+        default="train",
+        help="SURREAL texture list split used when --texture-path is not set.",
+    )
+    parser.add_argument(
+        "--clothing-option",
+        choices=("all", "grey", "nongrey"),
+        default="all",
+        help="Filter for SURREAL clothing texture lists.",
+    )
+    parser.add_argument(
+        "--texture-index",
+        type=int,
+        default=None,
+        help="Deterministic index into the filtered texture list.",
+    )
+    parser.add_argument(
+        "--texture-seed",
+        type=int,
+        default=0,
+        help="Seed for deterministic texture selection when --texture-index is unset.",
+    )
+    parser.add_argument(
+        "--no-texture",
+        action="store_true",
+        help="Export OBJ UVs but skip MTL writing and texture copying.",
+    )
     parser.add_argument(
         "--zrot",
         type=float,
@@ -270,7 +305,7 @@ def evaluated_mesh_for_object(ob):
     bpy.context.view_layer.update()
     evaluated = ob.evaluated_get(depsgraph)
     mesh = bpy.data.meshes.new_from_object(
-        evaluated, preserve_all_data_layers=False, depsgraph=depsgraph
+        evaluated, preserve_all_data_layers=True, depsgraph=depsgraph
     )
     return mesh, evaluated.matrix_world.copy()
 
@@ -307,26 +342,149 @@ def pelvis_world_position(arm_ob, obname):
     return vector_to_array(arm_ob.matrix_world @ pelvis)
 
 
-def write_obj(filepath, vertices, normals, mesh):
+def resolve_texture_source(smpl_data_folder, gender, args):
+    if args.no_texture:
+        return {
+            "enabled": False,
+            "source_path": None,
+            "list_path": None,
+            "list_entry": None,
+            "filtered_count": 0,
+            "index": None,
+        }
+
+    if args.texture_path:
+        source_path = abspath(args.texture_path)
+        if not exists(source_path):
+            raise FileNotFoundError("Missing texture image: %s" % source_path)
+        return {
+            "enabled": True,
+            "source_path": source_path,
+            "list_path": None,
+            "list_entry": None,
+            "filtered_count": None,
+            "index": None,
+        }
+
+    list_path = join(
+        smpl_data_folder, "textures", "%s_%s.txt" % (gender, args.texture_split)
+    )
+    if not exists(list_path):
+        raise FileNotFoundError("Missing texture list: %s" % list_path)
+
+    with open(list_path) as f:
+        entries = [line.strip() for line in f if line.strip()]
+
+    if args.clothing_option == "nongrey":
+        entries = [entry for entry in entries if "nongrey" in entry]
+    elif args.clothing_option == "grey":
+        entries = [entry for entry in entries if "nongrey" not in entry]
+
+    if not entries:
+        raise RuntimeError(
+            "No textures found for gender=%s split=%s clothing_option=%s."
+            % (gender, args.texture_split, args.clothing_option)
+        )
+
+    if args.texture_index is not None:
+        if args.texture_index < 0 or args.texture_index >= len(entries):
+            raise ValueError(
+                "--texture-index %d is out of range for %d filtered textures."
+                % (args.texture_index, len(entries))
+            )
+        index = args.texture_index
+    else:
+        rng = np.random.RandomState(args.texture_seed)
+        index = int(rng.randint(len(entries)))
+
+    list_entry = entries[index]
+    source_path = abspath(join(smpl_data_folder, list_entry))
+    if not exists(source_path):
+        raise FileNotFoundError("Missing texture image: %s" % source_path)
+
+    return {
+        "enabled": True,
+        "source_path": source_path,
+        "list_path": abspath(list_path),
+        "list_entry": list_entry,
+        "filtered_count": len(entries),
+        "index": index,
+    }
+
+
+def prepare_texture_output(output_dir, texture_info):
+    if not texture_info["enabled"]:
+        return None, None
+
+    texture_dir = join(output_dir, "textures")
+    os.makedirs(texture_dir, exist_ok=True)
+    output_path = join(texture_dir, basename(texture_info["source_path"]))
+    if abspath(output_path) != texture_info["source_path"]:
+        shutil.copy2(texture_info["source_path"], output_path)
+
+    material_path = join(output_dir, "material.mtl")
+    texture_relpath = relpath(output_path, output_dir)
+    with open(material_path, "w") as f:
+        f.write("# SURREAL SMPL clothing material\n")
+        f.write("newmtl smpl_clothing\n")
+        f.write("Ka 1.000000 1.000000 1.000000\n")
+        f.write("Kd 1.000000 1.000000 1.000000\n")
+        f.write("Ks 0.000000 0.000000 0.000000\n")
+        f.write("d 1.000000\n")
+        f.write("illum 2\n")
+        f.write("map_Kd %s\n" % texture_relpath.replace(os.sep, "/"))
+
+    return abspath(output_path), abspath(material_path)
+
+
+def active_uv_layer(mesh, require_uv):
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None and len(mesh.uv_layers) > 0:
+        uv_layer = mesh.uv_layers[0]
+    if require_uv and uv_layer is None:
+        raise RuntimeError("Evaluated SMPL mesh has no UV layer for texture export.")
+    return uv_layer
+
+
+def write_obj(filepath, vertices, uvs, normals, mesh, material_file=None):
+    has_uvs = len(uvs) == len(mesh.loops)
     with open(filepath, "w") as f:
         f.write("# Canonical pelvis-XY-centered, feet-grounded SMPL OBJ\n")
+        if material_file is not None:
+            f.write("mtllib %s\n" % material_file)
         f.write("o smpl_canonical\n")
         for vertex in vertices:
             f.write("v %.9f %.9f %.9f\n" % tuple(vertex))
+        if has_uvs:
+            for uv in uvs:
+                f.write("vt %.9f %.9f\n" % tuple(uv))
         for normal in normals:
             f.write("vn %.9f %.9f %.9f\n" % tuple(normal))
+        if material_file is not None:
+            f.write("usemtl smpl_clothing\n")
         for polygon in mesh.polygons:
             face = []
             for vertex_index, loop_index in zip(polygon.vertices, polygon.loop_indices):
-                face.append("%d//%d" % (vertex_index + 1, loop_index + 1))
+                if has_uvs:
+                    token = "%d/%d/%d" % (
+                        vertex_index + 1,
+                        loop_index + 1,
+                        loop_index + 1,
+                    )
+                else:
+                    token = "%d//%d" % (vertex_index + 1, loop_index + 1)
+                face.append(token)
             f.write("f %s\n" % " ".join(face))
 
 
-def export_evaluated_obj(ob, filepath, pelvis_world, source_to_target):
+def export_evaluated_obj(
+    ob, filepath, pelvis_world, source_to_target, material_file=None, require_uv=True
+):
     mesh, matrix_world = evaluated_mesh_for_object(ob)
     try:
         normal_matrix = matrix_world.to_3x3().inverted().transposed()
         mesh.calc_normals_split()
+        uv_layer = active_uv_layer(mesh, require_uv)
 
         pelvis_target = source_to_target.dot(pelvis_world)
         vertices = np.empty((len(mesh.vertices), 3), dtype=np.float64)
@@ -346,11 +504,31 @@ def export_evaluated_obj(ob, filepath, pelvis_world, source_to_target):
             length = np.linalg.norm(normal)
             normals[index] = normal / length if length > 0.0 else normal
 
-        write_obj(filepath, vertices, normals, mesh)
+        if uv_layer is None:
+            uvs = np.empty((0, 2), dtype=np.float64)
+        else:
+            uvs = np.empty((len(mesh.loops), 2), dtype=np.float64)
+            for index, uv_data in enumerate(uv_layer.data):
+                uvs[index] = uv_data.uv
+
+        material_ref = basename(material_file) if material_file is not None else None
+        write_obj(filepath, vertices, uvs, normals, mesh, material_ref)
 
         vertex_count = len(mesh.vertices)
         face_count = len(mesh.polygons)
-        return vertex_count, face_count, ground_height
+        loop_count = len(mesh.loops)
+        uv_count = len(uvs)
+        normal_count = len(normals)
+        uv_layer_name = uv_layer.name if uv_layer is not None else None
+        return (
+            vertex_count,
+            face_count,
+            loop_count,
+            uv_count,
+            normal_count,
+            uv_layer_name,
+            ground_height,
+        )
     finally:
         bpy.data.meshes.remove(mesh)
 
@@ -362,6 +540,8 @@ def validate_args(args, poses):
         raise ValueError("--frames must be positive.")
     if args.stepsize <= 0:
         raise ValueError("--stepsize must be positive.")
+    if args.texture_index is not None and args.texture_index < 0:
+        raise ValueError("--texture-index must be non-negative.")
 
     last_frame = args.start + (args.frames - 1) * args.stepsize
     if last_frame >= len(poses):
@@ -409,6 +589,13 @@ def main():
     )
     output_dir = abspath(join(args.out, sequence_dir))
     os.makedirs(output_dir, exist_ok=True)
+    texture_info = resolve_texture_source(smpl_data_folder, args.gender, args)
+    texture_output_path, material_path = prepare_texture_output(output_dir, texture_info)
+    if texture_info["enabled"]:
+        print("Using clothing texture: %s" % texture_info["source_path"])
+        print("Wrote material: %s" % material_path)
+    else:
+        print("Texture export disabled by --no-texture")
 
     source_frame_indices = [
         args.start + export_frame * args.stepsize for export_frame in range(args.frames)
@@ -418,6 +605,10 @@ def main():
     ground_heights = []
     vertex_count = None
     face_count = None
+    loop_count = None
+    uv_count = None
+    normal_count = None
+    uv_layer_name = None
 
     print("Exporting %d OBJ frames to %s" % (args.frames, output_dir))
     for export_frame, source_frame in enumerate(source_frame_indices):
@@ -429,14 +620,40 @@ def main():
         filename = "frame_%06d.obj" % export_frame
         filepath = join(output_dir, filename)
         pelvis_world = pelvis_world_position(arm_ob, obname)
-        curr_vertex_count, curr_face_count, ground_height = export_evaluated_obj(
-            ob, filepath, pelvis_world, source_to_target
+        (
+            curr_vertex_count,
+            curr_face_count,
+            curr_loop_count,
+            curr_uv_count,
+            curr_normal_count,
+            curr_uv_layer_name,
+            ground_height,
+        ) = export_evaluated_obj(
+            ob,
+            filepath,
+            pelvis_world,
+            source_to_target,
+            material_file=material_path,
+            require_uv=texture_info["enabled"],
         )
         if vertex_count is None:
             vertex_count = curr_vertex_count
             face_count = curr_face_count
-        elif vertex_count != curr_vertex_count or face_count != curr_face_count:
-            raise RuntimeError("Vertex/face count changed while exporting %s." % filename)
+            loop_count = curr_loop_count
+            uv_count = curr_uv_count
+            normal_count = curr_normal_count
+            uv_layer_name = curr_uv_layer_name
+        elif (
+            vertex_count != curr_vertex_count
+            or face_count != curr_face_count
+            or loop_count != curr_loop_count
+            or uv_count != curr_uv_count
+            or normal_count != curr_normal_count
+            or uv_layer_name != curr_uv_layer_name
+        ):
+            raise RuntimeError(
+                "Mesh topology, UVs, or normals changed while exporting %s." % filename
+            )
         exported_files.append(filename)
         pelvis_positions.append(pelvis_world.tolist())
         ground_heights.append(ground_height)
@@ -473,6 +690,21 @@ def main():
         "smpl_data_path": abspath(smpl_data_path),
         "vertex_count": vertex_count,
         "face_count": face_count,
+        "loop_count": loop_count,
+        "uv_layer": uv_layer_name,
+        "uv_count": uv_count,
+        "normal_count": normal_count,
+        "texture_enabled": texture_info["enabled"],
+        "texture_source_path": texture_info["source_path"],
+        "texture_output_path": texture_output_path,
+        "texture_split": args.texture_split,
+        "clothing_option": args.clothing_option,
+        "texture_index": texture_info["index"],
+        "texture_seed": args.texture_seed,
+        "texture_list_path": texture_info["list_path"],
+        "texture_list_entry": texture_info["list_entry"],
+        "texture_filtered_count": texture_info["filtered_count"],
+        "material_file": material_path,
         "exported_files": exported_files,
     }
 
